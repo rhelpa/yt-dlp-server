@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>yt-dlp Server</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+        h1 { color: #f90; }
+        input, select { width: 100%; padding: 8px; margin: 8px 0; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; }
+        button { padding: 10px 24px; background: #f90; color: #000; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #ffa733; }
+        #log { margin-top: 20px; background: #000; padding: 12px; border-radius: 4px; font-family: monospace; font-size: 13px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+        .status { margin-top: 10px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>yt-dlp Downloader</h1>
+
+    <label>URL</label>
+    <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." />
+
+    <label>Format</label>
+    <select id="format">
+        <option value="bestvideo+bestaudio/best">Best Video + Audio (merged)</option>
+        <option value="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]">Best MP4</option>
+        <option value="bestaudio/best">Best Audio Only</option>
+        <option value="bestaudio[ext=m4a]">Audio Only (m4a)</option>
+    </select>
+
+    <button onclick="startDownload()">Download</button>
+
+    <div class="status" id="status"></div>
+    <div id="log"></div>
+
+    <script>
+        function startDownload() {
+            const url = document.getElementById("url").value.trim();
+            const fmt = document.getElementById("format").value;
+            const log = document.getElementById("log");
+            const statusEl = document.getElementById("status");
+
+            if (!url) { alert("Please enter a URL."); return; }
+
+            log.textContent = "";
+            statusEl.textContent = "Starting...";
+
+            fetch("/download", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url, format: fmt })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) { statusEl.textContent = "Error: " + data.error; return; }
+
+                const jobId = data.job_id;
+                statusEl.textContent = "Downloading...";
+
+                const evtSource = new EventSource(`/stream/${jobId}`);
+                evtSource.onmessage = (e) => {
+                    if (e.data.startsWith("[DONE:")) {
+                        const result = e.data.includes("done") ? "✅ Done!" : "❌ Error";
+                        statusEl.textContent = result;
+                        evtSource.close();
+                    } else {
+                        log.textContent += e.data + "\n";
+                        log.scrollTop = log.scrollHeight;
+                    }
+                };
+            });
+        }
+    </script>
+</body>
+</html>

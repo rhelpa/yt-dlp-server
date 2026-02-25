@@ -30,7 +30,7 @@ A lightweight local web server that wraps [yt-dlp](https://github.com/yt-dlp/yt-
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/rhelpa1/yt-dlp-server.git
+git clone https://github.com/rhelpa/yt-dlp-server.git
 cd yt-dlp-server
 ```
 

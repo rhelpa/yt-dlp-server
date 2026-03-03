@@ -9,6 +9,8 @@
         input, select { width: 100%; padding: 8px; margin: 8px 0; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; }
         button { padding: 10px 24px; background: #f90; color: #000; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; }
         button:hover { background: #ffa733; }
+        #stopBtn { background: #c0392b; color: #fff; display: none; margin-left: 8px; }
+        #stopBtn:hover { background: #e74c3c; }
         #log { margin-top: 20px; background: #000; padding: 12px; border-radius: 4px; font-family: monospace; font-size: 13px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
         .status { margin-top: 10px; font-weight: bold; }
     </style>
@@ -28,16 +30,20 @@
     </select>
 
     <button onclick="startDownload()">Download</button>
+    <button id="stopBtn" onclick="stopDownload()">Stop</button>
 
     <div class="status" id="status"></div>
     <div id="log"></div>
 
     <script>
+        let activeJobId = null;
+
         function startDownload() {
             const url = document.getElementById("url").value.trim();
             const fmt = document.getElementById("format").value;
             const log = document.getElementById("log");
             const statusEl = document.getElementById("status");
+            const stopBtn = document.getElementById("stopBtn");
 
             if (!url) { alert("Please enter a URL."); return; }
 
@@ -53,14 +59,20 @@
             .then(data => {
                 if (data.error) { statusEl.textContent = "Error: " + data.error; return; }
 
-                const jobId = data.job_id;
+                activeJobId = data.job_id;
                 statusEl.textContent = "Downloading...";
+                stopBtn.style.display = "inline-block";
 
-                const evtSource = new EventSource(`/stream/${jobId}`);
+                const evtSource = new EventSource(`/stream/${activeJobId}`);
                 evtSource.onmessage = (e) => {
                     if (e.data.startsWith("[DONE:")) {
-                        const result = e.data.includes("done") ? "✅ Done!" : "❌ Error";
+                        let result;
+                        if (e.data.includes("done")) result = "✅ Done!";
+                        else if (e.data.includes("cancelled")) result = "🛑 Stopped.";
+                        else result = "❌ Error";
                         statusEl.textContent = result;
+                        stopBtn.style.display = "none";
+                        activeJobId = null;
                         evtSource.close();
                     } else {
                         log.textContent += e.data + "\n";
@@ -68,6 +80,17 @@
                     }
                 };
             });
+        }
+
+        function stopDownload() {
+            if (!activeJobId) return;
+            fetch(`/cancel/${activeJobId}`, { method: "POST" })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById("status").textContent = "Stop failed: " + data.error;
+                    }
+                });
         }
     </script>
 </body>

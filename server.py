@@ -49,6 +49,9 @@ def run_download(job_id, url, fmt):
         text=True
     )
 
+    with jobs_lock:
+        jobs[job_id]["process"] = process
+
     for line in process.stdout:
         with jobs_lock:
             jobs[job_id]["log"].append(line.strip())
@@ -56,19 +59,21 @@ def run_download(job_id, url, fmt):
     process.wait()
 
     with jobs_lock:
-        jobs[job_id]["status"] = "done" if process.returncode == 0 else "error"
+        if jobs[job_id]["status"] != "cancelled":
+            jobs[job_id]["status"] = "done" if process.returncode == 0 else "error"
         jobs[job_id]["finished_at"] = time.time()
+        jobs[job_id]["process"] = None
 
 
 def cleanup_jobs():
-    """Purge completed/errored jobs older than 1 hour, every 5 minutes."""
+    """Purge completed/errored/cancelled jobs older than 1 hour, every 5 minutes."""
     while True:
         time.sleep(300)
         cutoff = time.time() - 3600
         with jobs_lock:
             to_delete = [
                 jid for jid, job in jobs.items()
-                if job["status"] in ("done", "error")
+                if job["status"] in ("done", "error", "cancelled")
                 and job.get("finished_at", 0) < cutoff
             ]
             for jid in to_delete:
@@ -105,7 +110,7 @@ def download():
 
     job_id = str(uuid.uuid4())
     with jobs_lock:
-        jobs[job_id] = {"status": "queued", "log": [], "finished_at": None}
+        jobs[job_id] = {"status": "queued", "log": [], "finished_at": None, "process": None}
 
     thread = threading.Thread(target=run_download, args=(job_id, url, fmt))
     thread.daemon = True
@@ -123,6 +128,22 @@ def status(job_id):
     return jsonify(job)
 
 
+@app.route("/cancel/<job_id>", methods=["POST"])
+def cancel(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    process = job.get("process")
+    if job["status"] != "running" or not process:
+        return jsonify({"error": "Job is not running"}), 400
+    process.terminate()
+    with jobs_lock:
+        jobs[job_id]["status"] = "cancelled"
+        jobs[job_id]["finished_at"] = time.time()
+    return jsonify({"ok": True})
+
+
 @app.route("/stream/<job_id>")
 def stream(job_id):
     """Server-Sent Events endpoint for live log streaming."""
@@ -138,7 +159,7 @@ def stream(job_id):
             while sent < len(log):
                 yield f"data: {log[sent]}\n\n"
                 sent += 1
-            if job["status"] in ("done", "error"):
+            if job["status"] in ("done", "error", "cancelled"):
                 yield f"data: [DONE: {job['status']}]\n\n"
                 break
             time.sleep(0.25)

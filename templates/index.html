@@ -4,15 +4,43 @@
     <meta charset="UTF-8">
     <title>yt-dlp Server</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
-        h1 { color: #f90; }
-        input, select { width: 100%; padding: 8px; margin: 8px 0; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; }
-        button { padding: 10px 24px; background: #f90; color: #000; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; }
-        button:hover { background: #ffa733; }
-        #stopBtn { background: #c0392b; color: #fff; display: none; margin-left: 8px; }
-        #stopBtn:hover { background: #e74c3c; }
-        #log { margin-top: 20px; background: #000; padding: 12px; border-radius: 4px; font-family: monospace; font-size: 13px; height: 300px; overflow-y: auto; white-space: pre-wrap; }
-        .status { margin-top: 10px; font-weight: bold; }
+        *, *::before, *::after { box-sizing: border-box; }
+        body { font-family: sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+        h1 { color: #f90; margin-bottom: 20px; }
+        h2 { color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; margin-top: 32px; margin-bottom: 8px; border-bottom: 1px solid #2a2a2a; padding-bottom: 6px; }
+        label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 2px; }
+        input[type=text], select { width: 100%; padding: 8px; margin-bottom: 10px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; font-size: 0.95rem; }
+        .options { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 12px; }
+        .options label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; color: #ccc; margin: 0; }
+        .options input[type=checkbox] { accent-color: #f90; width: 15px; height: 15px; cursor: pointer; }
+        .btn { padding: 10px 24px; font-weight: bold; border: none; border-radius: 4px; cursor: pointer; font-size: 0.95rem; }
+        .btn-primary { background: #f90; color: #000; }
+        .btn-primary:hover { background: #ffa733; }
+        .btn-stop { background: #c0392b; color: #fff; padding: 3px 12px; font-size: 0.8rem; }
+        .btn-stop:hover { background: #e74c3c; }
+
+        /* Job cards */
+        .job-card { background: #191919; border: 1px solid #2d2d2d; border-radius: 6px; padding: 12px 14px; margin-bottom: 8px; }
+        .job-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .job-url { font-size: 0.82rem; color: #999; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-family: monospace; }
+        .badge { padding: 2px 9px; border-radius: 10px; font-size: 0.72rem; font-weight: bold; white-space: nowrap; }
+        .badge-queued       { background: #2a2a2a; color: #888; }
+        .badge-running      { background: #1b3320; color: #4caf50; }
+        .badge-done         { background: #1b3320; color: #66bb6a; }
+        .badge-error        { background: #3a1515; color: #ef5350; }
+        .badge-cancelled    { background: #2e2a14; color: #ffa726; }
+        .badge-reconnecting { background: #141e36; color: #5c9cf5; }
+
+        /* Progress bar */
+        .progress-wrap { display: flex; align-items: center; gap: 10px; margin: 8px 0 6px; }
+        .progress-bg { flex: 1; height: 5px; background: #2a2a2a; border-radius: 3px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #f90; border-radius: 3px; transition: width 0.4s ease; width: 0%; }
+        .progress-pct { font-size: 0.72rem; color: #888; min-width: 34px; text-align: right; }
+
+        /* Log */
+        .job-log { background: #0d0d0d; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 11px; height: 80px; overflow-y: auto; white-space: pre-wrap; color: #bbb; margin-top: 4px; }
+
+        .empty-note { color: #444; font-size: 0.88rem; font-style: italic; padding: 6px 0; }
     </style>
 </head>
 <body>
@@ -29,68 +57,201 @@
         <option value="bestaudio[ext=m4a]">Audio Only (m4a)</option>
     </select>
 
-    <button onclick="startDownload()">Download</button>
-    <button id="stopBtn" onclick="stopDownload()">Stop</button>
+    <div class="options">
+        <label><input type="checkbox" id="opt-subs">  Embed subtitles</label>
+        <label><input type="checkbox" id="opt-thumb"> Embed thumbnail</label>
+        <label><input type="checkbox" id="opt-meta">  Add metadata</label>
+    </div>
 
-    <div class="status" id="status"></div>
-    <div id="log"></div>
+    <button class="btn btn-primary" onclick="startDownload()">Download</button>
+
+    <h2>Active Downloads</h2>
+    <div id="active-jobs"><p class="empty-note">No active downloads.</p></div>
+
+    <h2>History</h2>
+    <div id="history-jobs"><p class="empty-note">No completed downloads yet.</p></div>
 
     <script>
-        let activeJobId = null;
+        // Client-side job registry
+        const clientJobs = {};
 
+        // ── Paste-and-go ──────────────────────────────────────────────────────
+        document.getElementById('url').addEventListener('paste', () => {
+            setTimeout(() => {
+                const val = document.getElementById('url').value.trim();
+                if (val.startsWith('http://') || val.startsWith('https://')) {
+                    startDownload();
+                }
+            }, 0);
+        });
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+        function truncateUrl(url, max = 70) {
+            return url.length > max ? url.slice(0, max) + '\u2026' : url;
+        }
+
+        function statusBadge(status) {
+            const map = {
+                queued:       ['badge-queued',       'Queued'],
+                running:      ['badge-running',      'Running'],
+                done:         ['badge-done',         'Done \u2713'],
+                error:        ['badge-error',        'Error'],
+                cancelled:    ['badge-cancelled',    'Stopped'],
+                reconnecting: ['badge-reconnecting', 'Reconnecting\u2026'],
+            };
+            const [cls, label] = map[status] || ['badge-queued', status];
+            return `<span class="badge ${cls}">${label}</span>`;
+        }
+
+        // ── Card creation ─────────────────────────────────────────────────────
+        function buildCard(jobId, url, withControls) {
+            const card = document.createElement('div');
+            card.className = 'job-card';
+            card.id = `job-${jobId}`;
+
+            const stopBtn = withControls
+                ? `<button class="btn btn-stop" id="stop-${jobId}" onclick="stopJob('${jobId}')">Stop</button>`
+                : '';
+
+            const progressHtml = withControls ? `
+                <div class="progress-wrap">
+                    <div class="progress-bg">
+                        <div class="progress-fill" id="pfill-${jobId}"></div>
+                    </div>
+                    <span class="progress-pct" id="ppct-${jobId}">0%</span>
+                </div>
+                <div class="job-log" id="log-${jobId}"></div>` : '';
+
+            card.innerHTML = `
+                <div class="job-header">
+                    <span class="job-url" title="${url}">${truncateUrl(url)}</span>
+                    <span id="badge-${jobId}">${statusBadge('queued')}</span>
+                    ${stopBtn}
+                </div>${progressHtml}`;
+
+            return card;
+        }
+
+        function addToActive(jobId, url) {
+            const container = document.getElementById('active-jobs');
+            container.querySelector('.empty-note')?.remove();
+            container.appendChild(buildCard(jobId, url, true));
+        }
+
+        function moveToHistory(jobId) {
+            document.getElementById(`job-${jobId}`)?.remove();
+
+            const activeContainer = document.getElementById('active-jobs');
+            if (!activeContainer.querySelector('.job-card')) {
+                activeContainer.innerHTML = '<p class="empty-note">No active downloads.</p>';
+            }
+
+            const job = clientJobs[jobId];
+            const histContainer = document.getElementById('history-jobs');
+            histContainer.querySelector('.empty-note')?.remove();
+
+            const card = buildCard(jobId, job?.url || '', false);
+            card.querySelector(`#badge-${jobId}`).innerHTML = statusBadge(job?.status || 'done');
+            histContainer.prepend(card);
+        }
+
+        function setBadge(jobId, status) {
+            const el = document.getElementById(`badge-${jobId}`);
+            if (el) el.innerHTML = statusBadge(status);
+        }
+
+        function setProgress(jobId, pct) {
+            const fill = document.getElementById(`pfill-${jobId}`);
+            const label = document.getElementById(`ppct-${jobId}`);
+            if (fill) fill.style.width = pct + '%';
+            if (label) label.textContent = pct + '%';
+        }
+
+        function appendLog(jobId, line) {
+            const el = document.getElementById(`log-${jobId}`);
+            if (!el) return;
+            el.textContent += line + '\n';
+            el.scrollTop = el.scrollHeight;
+
+            const match = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
+            if (match) setProgress(jobId, parseFloat(match[1]).toFixed(1));
+        }
+
+        // ── SSE stream with reconnect ─────────────────────────────────────────
+        function connectStream(jobId, attempt) {
+            const evtSource = new EventSource(`/stream/${jobId}`);
+            clientJobs[jobId].evtSource = evtSource;
+
+            evtSource.onmessage = (e) => {
+                if (e.data.startsWith('[DONE:')) {
+                    let finalStatus;
+                    if (e.data.includes('done'))      finalStatus = 'done';
+                    else if (e.data.includes('cancelled')) finalStatus = 'cancelled';
+                    else                              finalStatus = 'error';
+
+                    clientJobs[jobId].status = finalStatus;
+                    if (finalStatus === 'done') setProgress(jobId, 100);
+                    evtSource.close();
+                    moveToHistory(jobId);
+                } else {
+                    appendLog(jobId, e.data);
+                }
+            };
+
+            evtSource.onerror = () => {
+                evtSource.close();
+                const job = clientJobs[jobId];
+                if (!job || ['done', 'error', 'cancelled'].includes(job.status)) return;
+                if (attempt < 3) {
+                    setBadge(jobId, 'reconnecting');
+                    setTimeout(() => connectStream(jobId, attempt + 1), 1500 * (attempt + 1));
+                } else {
+                    appendLog(jobId, '[Connection lost — reload page to check status]');
+                    setBadge(jobId, 'error');
+                }
+            };
+        }
+
+        // ── Actions ───────────────────────────────────────────────────────────
         function startDownload() {
-            const url = document.getElementById("url").value.trim();
-            const fmt = document.getElementById("format").value;
-            const log = document.getElementById("log");
-            const statusEl = document.getElementById("status");
-            const stopBtn = document.getElementById("stopBtn");
+            const urlInput = document.getElementById('url');
+            const url = urlInput.value.trim();
+            const fmt = document.getElementById('format').value;
 
-            if (!url) { alert("Please enter a URL."); return; }
+            if (!url) { alert('Please enter a URL.'); return; }
 
-            log.textContent = "";
-            statusEl.textContent = "Starting...";
+            const extraFlags = [];
+            if (document.getElementById('opt-subs').checked)  extraFlags.push('--embed-subs');
+            if (document.getElementById('opt-thumb').checked) extraFlags.push('--embed-thumbnail');
+            if (document.getElementById('opt-meta').checked)  extraFlags.push('--add-metadata');
 
-            fetch("/download", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url, format: fmt })
+            fetch('/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, format: fmt, extra_flags: extraFlags })
             })
             .then(r => r.json())
             .then(data => {
-                if (data.error) { statusEl.textContent = "Error: " + data.error; return; }
+                if (data.error) { alert('Error: ' + data.error); return; }
 
-                activeJobId = data.job_id;
-                statusEl.textContent = "Downloading...";
-                stopBtn.style.display = "inline-block";
+                const jobId = data.job_id;
+                clientJobs[jobId] = { url, status: 'running', evtSource: null };
 
-                const evtSource = new EventSource(`/stream/${activeJobId}`);
-                evtSource.onmessage = (e) => {
-                    if (e.data.startsWith("[DONE:")) {
-                        let result;
-                        if (e.data.includes("done")) result = "✅ Done!";
-                        else if (e.data.includes("cancelled")) result = "🛑 Stopped.";
-                        else result = "❌ Error";
-                        statusEl.textContent = result;
-                        stopBtn.style.display = "none";
-                        activeJobId = null;
-                        evtSource.close();
-                    } else {
-                        log.textContent += e.data + "\n";
-                        log.scrollTop = log.scrollHeight;
-                    }
-                };
+                addToActive(jobId, url);
+                setBadge(jobId, 'running');
+                connectStream(jobId, 0);
+
+                urlInput.value = '';
             });
         }
 
-        function stopDownload() {
-            if (!activeJobId) return;
-            fetch(`/cancel/${activeJobId}`, { method: "POST" })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.error) {
-                        document.getElementById("status").textContent = "Stop failed: " + data.error;
-                    }
-                });
+        function stopJob(jobId) {
+            fetch(`/cancel/${jobId}`, { method: 'POST' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) alert('Stop failed: ' + data.error);
+                // SSE will send [DONE: cancelled], which triggers moveToHistory
+            });
         }
     </script>
 </body>

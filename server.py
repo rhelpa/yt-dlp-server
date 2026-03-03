@@ -3,6 +3,7 @@ import threading
 import uuid
 import time
 import os
+from collections import defaultdict, deque
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, render_template, Response, abort
 
@@ -11,10 +12,22 @@ app = Flask(__name__)
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/mnt/yt-dlp/")
 YTDLP_BIN = os.getenv("YTDLP_BIN", "/home/rickh/yt-dlp-server/.venv/bin/yt-dlp")
 ALLOWED_NETWORKS = ("127.", "192.168.", "10.", "172.")
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "3"))
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT", "10"))
+RATE_LIMIT_WINDOW = 60  # seconds
 
-# In-memory job store: { job_id: { "status": ..., "log": [...], "finished_at": ... } }
+ALLOWED_EXTRA_FLAGS = {"--write-subs", "--embed-subs", "--embed-thumbnail", "--add-metadata"}
+
+# In-memory job store: { job_id: { status, log, finished_at, process, url } }
 jobs = {}
 jobs_lock = threading.Lock()
+
+# Concurrent download semaphore
+_dl_semaphore = threading.Semaphore(MAX_CONCURRENT)
+
+# Per-IP rate limiting: { ip: deque of request timestamps }
+_rate_store = defaultdict(deque)
+_rate_lock = threading.Lock()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -27,9 +40,32 @@ def is_valid_url(url):
         return False
 
 
+def check_rate_limit(ip):
+    now = time.time()
+    with _rate_lock:
+        timestamps = _rate_store[ip]
+        while timestamps and timestamps[0] < now - RATE_LIMIT_WINDOW:
+            timestamps.popleft()
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            return False
+        timestamps.append(now)
+        return True
+
+
+def job_to_dict(job_id, job):
+    """Return a JSON-serialisable view of a job (excludes subprocess handle)."""
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "log": job["log"],
+        "finished_at": job["finished_at"],
+        "url": job.get("url", ""),
+    }
+
+
 # ── Background Workers ────────────────────────────────────────────────────────
 
-def run_download(job_id, url, fmt):
+def run_download(job_id, url, fmt, extra_flags):
     cmd = [
         YTDLP_BIN,
         "-f", fmt,
@@ -37,32 +73,39 @@ def run_download(job_id, url, fmt):
         "--newline",
         "--js-runtimes", "node",
         "--no-overwrites",
-        url
+        "--restrict-filenames",
     ]
+    cmd.extend(extra_flags)
+    cmd.append(url)
+
     with jobs_lock:
         jobs[job_id]["status"] = "running"
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
 
-    with jobs_lock:
-        jobs[job_id]["process"] = process
-
-    for line in process.stdout:
         with jobs_lock:
-            jobs[job_id]["log"].append(line.strip())
+            jobs[job_id]["process"] = process
 
-    process.wait()
+        for line in process.stdout:
+            with jobs_lock:
+                jobs[job_id]["log"].append(line.strip())
 
-    with jobs_lock:
-        if jobs[job_id]["status"] != "cancelled":
-            jobs[job_id]["status"] = "done" if process.returncode == 0 else "error"
-        jobs[job_id]["finished_at"] = time.time()
-        jobs[job_id]["process"] = None
+        process.wait()
+
+        with jobs_lock:
+            if jobs[job_id]["status"] != "cancelled":
+                jobs[job_id]["status"] = "done" if process.returncode == 0 else "error"
+            jobs[job_id]["finished_at"] = time.time()
+            jobs[job_id]["process"] = None
+
+    finally:
+        _dl_semaphore.release()
 
 
 def cleanup_jobs():
@@ -98,9 +141,15 @@ def index():
 
 @app.route("/download", methods=["POST"])
 def download():
-    data = request.json
+    ip = request.remote_addr
+
+    if not check_rate_limit(ip):
+        return jsonify({"error": f"Rate limit exceeded — max {RATE_LIMIT_MAX} downloads per minute."}), 429
+
+    data = request.json or {}
     url = data.get("url", "").strip()
     fmt = data.get("format", "bestvideo+bestaudio/best")
+    raw_flags = data.get("extra_flags", [])
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -108,15 +157,34 @@ def download():
     if not is_valid_url(url):
         return jsonify({"error": "Invalid URL"}), 400
 
+    extra_flags = [f for f in raw_flags if f in ALLOWED_EXTRA_FLAGS]
+    if "--embed-subs" in extra_flags and "--write-subs" not in extra_flags:
+        extra_flags.insert(0, "--write-subs")
+
+    if not _dl_semaphore.acquire(blocking=False):
+        return jsonify({"error": f"Too many concurrent downloads (max {MAX_CONCURRENT}). Try again soon."}), 429
+
     job_id = str(uuid.uuid4())
     with jobs_lock:
-        jobs[job_id] = {"status": "queued", "log": [], "finished_at": None, "process": None}
+        jobs[job_id] = {"status": "queued", "log": [], "finished_at": None, "process": None, "url": url}
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, fmt))
-    thread.daemon = True
-    thread.start()
+    try:
+        thread = threading.Thread(target=run_download, args=(job_id, url, fmt, extra_flags))
+        thread.daemon = True
+        thread.start()
+    except Exception:
+        _dl_semaphore.release()
+        with jobs_lock:
+            del jobs[job_id]
+        raise
 
     return jsonify({"job_id": job_id})
+
+
+@app.route("/jobs")
+def list_jobs():
+    with jobs_lock:
+        return jsonify([job_to_dict(jid, j) for jid, j in jobs.items()])
 
 
 @app.route("/status/<job_id>")
@@ -125,7 +193,7 @@ def status(job_id):
         job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify(job)
+    return jsonify(job_to_dict(job_id, job))
 
 
 @app.route("/cancel/<job_id>", methods=["POST"])
